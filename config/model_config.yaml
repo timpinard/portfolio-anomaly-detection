@@ -1,0 +1,75 @@
+# Model configurations for portfolio anomaly detection
+
+data:
+  # Reference universe for training
+  universe: sp500_sample  # Options: sp500, sp500_sample, custom
+  custom_symbols: []  # Used if universe: custom
+  
+  # Time range for training data
+  lookback_years: 3
+  interval: "1day"  # Twelve Data interval
+  
+  # Update frequency
+  update_frequency: daily
+
+models:
+  # Autoencoder configuration
+  autoencoder:
+    encoding_dim: 15
+    hidden_dims: [128, 64, 32]
+    epochs: 100
+    batch_size: 64
+    learning_rate: 0.001
+    device: cuda  # or 'cpu'
+  
+  # Isolation Forest configuration
+  isolation_forest:
+    contamination: 0.05  # 5% of market is "unusual"
+    n_estimators: 200
+    max_samples: 1024 #auto is 256
+    random_state: 42
+
+features:
+  # Return calculation windows (days)
+  returns_windows: [1, 5, 20, 60]
+  
+  # Volatility windows (days)
+  volatility_windows: [20, 60]
+  
+  # Moving average windows (days)
+  ma_windows: [50, 200]
+  
+  # Technical indicators
+  technical_indicators:
+    - rsi  # Relative Strength Index
+    - macd  # Moving Average Convergence Divergence
+    - bollinger_bands
+  
+  # Volume analysis
+  volume_windows: [20, 60]
+
+portfolio:
+  # Portfolio-level feature calculations
+  enable_portfolio_features: true
+  
+  # Concentration thresholds
+  max_position_weight: 0.20  # 20%
+  max_sector_weight: 0.35  # 35%
+  
+  # Risk metrics
+  var_confidence: 0.95  # Value at Risk confidence level
+  drawdown_window: 90  # days
+
+api:
+  # API service configuration
+  host: "0.0.0.0"
+  port: 8000
+  reload: false  # Set to true for development
+  
+  # Rate limiting
+  rate_limit_requests: 100
+  rate_limit_window: 60  # seconds
+
+logging:
+  level: INFO
+  file: logs/portfolio_analysis.log

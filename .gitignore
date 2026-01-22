@@ -47,7 +47,10 @@ data/processed/*.sqlite
 models/**/*.pth
 models/**/*.joblib
 models/**/*.pkl
+models/**/*.pt
 models/**/*.json
+models/**/*.yaml
+models/**/*.png
 !models/**/.gitkeep
 
 # Logs

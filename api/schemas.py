@@ -49,14 +49,14 @@ class SecurityScore(BaseModel):
     ae_z_score: Optional[float] = Field(None, description="AE score z-score vs training basket")
     ae_z_score_display: Optional[str] = Field(None, description="Human-readable z-score (e.g., '>3σ extreme')")
     
-    # Isolation Forest scores
-    if_score: float = Field(..., description="Isolation Forest anomaly score")
-    if_is_anomaly: bool = Field(..., description="Whether IF flags as anomaly")
+    # Isolation Forest scores (optional - may not be available for all model types)
+    if_score: Optional[float] = Field(None, description="Isolation Forest anomaly score")
+    if_is_anomaly: Optional[bool] = Field(None, description="Whether IF flags as anomaly")
     if_z_score: Optional[float] = Field(None, description="IF score z-score vs training basket")
     if_z_score_display: Optional[str] = Field(None, description="Human-readable z-score")
     
     # Consensus
-    consensus_anomaly: bool = Field(..., description="Both models flag as anomaly")
+    consensus_anomaly: bool = Field(..., description="Both models flag as anomaly (or AE only if IF unavailable)")
     
     # Interpretation
     status: str = Field("normal", description="Human-readable status: normal, warning, anomaly")
@@ -71,8 +71,8 @@ class BasketStatistics(BaseModel):
     """Training basket statistics for z-score computation."""
     ae_mean: float = Field(..., description="Mean AE score across training basket")
     ae_std: float = Field(..., description="Std dev of AE scores")
-    if_mean: float = Field(..., description="Mean IF score across training basket")
-    if_std: float = Field(..., description="Std dev of IF scores")
+    if_mean: Optional[float] = Field(None, description="Mean IF score across training basket (optional)")
+    if_std: Optional[float] = Field(None, description="Std dev of IF scores (optional)")
     n_securities: int = Field(..., description="Number of securities in training basket")
     computed_at: Optional[str] = Field(None, description="When basket stats were computed")
 
@@ -91,17 +91,17 @@ class ExtendedPortfolioMetrics(BaseModel):
     
     # Aggregate z-scores (portfolio-weighted)
     ae_weighted_score: float = Field(..., description="Portfolio-weighted AE score")
-    if_weighted_score: float = Field(..., description="Portfolio-weighted IF score")
+    if_weighted_score: Optional[float] = Field(None, description="Portfolio-weighted IF score (optional)")
     ae_weighted_z_score: Optional[float] = Field(None, description="Portfolio-weighted AE z-score")
     if_weighted_z_score: Optional[float] = Field(None, description="Portfolio-weighted IF z-score")
     
     # Anomaly rates
     anomaly_rate_ae: float = Field(..., description="Fraction of holdings flagged by AE")
-    anomaly_rate_if: float = Field(..., description="Fraction of holdings flagged by IF")
-    anomaly_rate_consensus: float = Field(..., description="Fraction flagged by both models")
+    anomaly_rate_if: Optional[float] = Field(None, description="Fraction of holdings flagged by IF (optional)")
+    anomaly_rate_consensus: float = Field(..., description="Fraction flagged by both models (or AE only if IF unavailable)")
     anomaly_count_ae: int = Field(..., description="Number of holdings flagged by AE")
-    anomaly_count_if: int = Field(..., description="Number of holdings flagged by IF")
-    anomaly_count_consensus: int = Field(..., description="Number flagged by both models")
+    anomaly_count_if: Optional[int] = Field(None, description="Number of holdings flagged by IF (optional)")
+    anomaly_count_consensus: int = Field(..., description="Number flagged by both models (or AE only if IF unavailable)")
     
     # Per-security detail
     security_scores: List[SecurityScore] = Field(
@@ -185,11 +185,53 @@ class OrchestratedAnalysisResponse(BaseModel):
     """Combined response from orchestrated analyze + explain endpoint."""
     # Analysis results
     analysis: PortfolioAnalysisResponse
-    
+
     # LLM explanation (optional - may be None if LLM unavailable or requested to skip)
     explanation: Optional[LLMExplanationResponse] = Field(None, description="LLM explanation if available and requested")
-    
+
     # Metadata
     timestamp: str
     explanation_requested: bool = Field(True, description="Whether explanation was requested")
     explanation_available: bool = Field(False, description="Whether LLM explanation was successfully generated")
+
+
+class Holding(BaseModel):
+    """Individual holding with symbol and weight."""
+    symbol: str = Field(..., description="Ticker symbol")
+    weight: float = Field(..., description="Portfolio weight (0-1)")
+
+
+class PortfolioHealthRequest(BaseModel):
+    """Request for portfolio health analysis using experiment-based scoring."""
+    holdings: List[Holding] = Field(
+        ...,
+        description="List of holdings with symbols and weights",
+        json_schema_extra={
+            "example": [
+                {"symbol": "AAPL", "weight": 0.25},
+                {"symbol": "MSFT", "weight": 0.20},
+                {"symbol": "GOOGL", "weight": 0.15}
+            ]
+        }
+    )
+    analysis_date: str = Field(..., description="Analysis date in YYYY-MM-DD format")
+    model_type: str = Field("cross_sectional", description="Model type name for scoring (default: cross_sectional)")
+    market_proxy: str = Field("SPY", description="Market proxy symbol for comparison")
+    contra_horizon: int = Field(5, description="Number of days for contra return calculation")
+
+
+class Contributor(BaseModel):
+    """Contribution of a single holding to portfolio score."""
+    symbol: str = Field(..., description="Ticker symbol")
+    weight: float = Field(..., description="Portfolio weight")
+    ae_score: float = Field(..., description="Autoencoder anomaly score")
+    contribution: float = Field(..., description="Contribution to portfolio score (weight * ae_score)")
+
+
+class PortfolioHealthResponse(BaseModel):
+    """Response from portfolio health analysis."""
+    date: str = Field(..., description="Analysis date")
+    portfolio_score: float = Field(..., description="Aggregate portfolio anomaly score")
+    contra_return: float = Field(..., description="Portfolio return vs market over horizon")
+    health_score: float = Field(..., description="Combined health score (structural + contra)")
+    contributors: List[Contributor] = Field(..., description="Per-holding score contributions")

@@ -9,64 +9,111 @@ This creates visualizations to understand:
 4. Model agreement - where do models agree/disagree?
 
 Run this and examine the generated plots to validate model behavior.
+
+Usage:
+    python scripts/visualize_model.py
+    python scripts/visualize_model.py --model-type individual
+    python scripts/visualize_model.py --model-type cross_sectional
 """
 
 import sys
+import argparse
 from pathlib import Path
-import sqlite3
+from typing import Tuple, Optional
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime
 import shutil
+import logging
+import joblib
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 from models.autoencoder import AutoencoderAnomalyDetector
 from models.isolation_forest import IsolationForestAnomalyDetector
+from features.storage import FeatureStore
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def load_data_and_score(project_root: Path):
-    """Load data and get model scores."""
+def load_data_and_score(project_root: Path, model_type: str = 'individual') -> Tuple[pd.DataFrame, list, AutoencoderAnomalyDetector, Optional[IsolationForestAnomalyDetector]]:
+    """Load data and get model scores.
+    
+    Args:
+        project_root: Root directory of the project
+        model_type: Model type to use ('individual' or 'cross_sectional')
+    
+    Returns:
+        Tuple of (dataframe with scores, feature columns, AE model, IF model or None)
+    """
     db_path = project_root / 'data' / 'processed' / 'market_data.sqlite'
-    model_dir = project_root / 'models' / 'market_universe'
+    model_dir = project_root / 'models' / 'model_types' / model_type
     
-    # Load features
-    conn = sqlite3.connect(db_path)
-    df = pd.read_sql_query("SELECT * FROM market_features", conn)
-    df['date'] = pd.to_datetime(df['date'], utc=True).dt.tz_localize(None)
-    conn.close()
+    if not model_dir.exists():
+        logger.error(f"Model directory not found: {model_dir}")
+        logger.error(f"Run 'python scripts/train_model.py {model_type}' first")
+        sys.exit(1)
     
-    # Prepare features
-    exclude_cols = {'symbol', 'date'}
+    feature_store = FeatureStore(str(db_path))
+    if not feature_store.table_exists(model_type):
+        logger.error(f"Features not found for model type '{model_type}'")
+        logger.error(f"Run 'python scripts/train_model.py {model_type}' first")
+        sys.exit(1)
+    
+    logger.info(f"Loading features for model type: {model_type}")
+    df = feature_store.load_features(model_type)
+    
+    if 'date' in df.columns:
+        if not pd.api.types.is_datetime64_any_dtype(df['date']):
+            df['date'] = pd.to_datetime(df['date'])
+        if df['date'].dt.tz is not None:
+            df['date'] = df['date'].dt.tz_localize(None)
+    
+    exclude_cols = {'symbol', 'date', 'index'}
     feature_cols = [col for col in df.columns if col not in exclude_cols]
     X = df[feature_cols].values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     
-    # Load and score with both models
-    ae_model = AutoencoderAnomalyDetector(sector='autoencoder', model_dir=model_dir)
-    ae_model.load()
+    scaler_path = model_dir / 'scaler.joblib'
+    if scaler_path.exists():
+        scaler = joblib.load(scaler_path)
+        X = scaler.transform(X)
+        logger.info("Applied feature scaler")
     
-    if_model = IsolationForestAnomalyDetector(sector='isolation_forest', model_dir=model_dir)
-    if_model.load()
+    ae_model = AutoencoderAnomalyDetector.load(model_dir / 'autoencoder')
     
-    # Get scores and predictions
+    if_model = None
+    if_path = model_dir / 'isolation_forest' / 'model.joblib'
+    if if_path.exists():
+        if_model = IsolationForestAnomalyDetector(sector='isolation_forest', model_dir=model_dir)
+        if_model.load()
+    else:
+        logger.warning("Isolation Forest model not found, using autoencoder only")
+    
     df['ae_score'] = ae_model.score(X)
     df['ae_anomaly'] = ae_model.predict(X) == -1
     df['ae_threshold'] = ae_model.threshold
     
-    df['if_score'] = if_model.score(X)
-    df['if_anomaly'] = if_model.predict(X) == -1
+    if if_model is not None:
+        df['if_score'] = if_model.score(X)
+        df['if_anomaly'] = if_model.predict(X) == -1
+    else:
+        df['if_score'] = 0.0
+        df['if_anomaly'] = False
     
     return df, feature_cols, ae_model, if_model
 
 
-def plot_score_distributions(df: pd.DataFrame, output_dir: Path):
+def plot_score_distributions(df: pd.DataFrame, output_dir: Path) -> None:
     """Plot 1: Score distributions with thresholds."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    # AE score histogram
     ax = axes[0, 0]
     ax.hist(df['ae_score'], bins=100, alpha=0.7, color='steelblue', edgecolor='black')
     ax.axvline(df['ae_threshold'].iloc[0], color='red', linestyle='--', linewidth=2, label=f'Threshold: {df["ae_threshold"].iloc[0]:.4f}')
@@ -76,7 +123,6 @@ def plot_score_distributions(df: pd.DataFrame, output_dir: Path):
     ax.legend()
     ax.set_yscale('log')
     
-    # AE score - zoomed on tail
     ax = axes[0, 1]
     threshold = df['ae_threshold'].iloc[0]
     tail_data = df[df['ae_score'] > threshold * 0.5]['ae_score']
@@ -87,7 +133,6 @@ def plot_score_distributions(df: pd.DataFrame, output_dir: Path):
     ax.set_title('Autoencoder Score - Tail (>50% of threshold)')
     ax.legend()
     
-    # IF score histogram
     ax = axes[1, 0]
     ax.hist(df['if_score'], bins=100, alpha=0.7, color='forestgreen', edgecolor='black')
     ax.axvline(0, color='red', linestyle='--', linewidth=2, label='Threshold (0)')
@@ -97,9 +142,7 @@ def plot_score_distributions(df: pd.DataFrame, output_dir: Path):
     ax.legend()
     ax.set_yscale('log')
     
-    # Score correlation
     ax = axes[1, 1]
-    # Sample for performance
     sample_idx = np.random.choice(len(df), min(5000, len(df)), replace=False)
     sample = df.iloc[sample_idx]
     
@@ -118,11 +161,10 @@ def plot_score_distributions(df: pd.DataFrame, output_dir: Path):
     print(f"Saved: {output_dir / 'score_distributions.png'}")
 
 
-def plot_anomalies_over_time(df: pd.DataFrame, output_dir: Path):
+def plot_anomalies_over_time(df: pd.DataFrame, output_dir: Path) -> None:
     """Plot 2: Anomaly scores over time."""
     fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
     
-    # Aggregate by date (mean score per day)
     daily = df.groupby('date').agg({
         'ae_score': 'mean',
         'if_score': 'mean',
@@ -134,12 +176,10 @@ def plot_anomalies_over_time(df: pd.DataFrame, output_dir: Path):
     daily['ae_anomaly_rate'] = daily['ae_anomaly'] / daily['n_samples']
     daily['if_anomaly_rate'] = daily['if_anomaly'] / daily['n_samples']
     
-    # AE score over time
     ax = axes[0]
     ax.plot(daily.index, daily['ae_score'], color='steelblue', alpha=0.7, linewidth=0.5)
     ax.axhline(df['ae_threshold'].iloc[0], color='red', linestyle='--', label='Threshold')
     
-    # Highlight high-anomaly periods
     high_anomaly_dates = daily[daily['ae_anomaly_rate'] > 0.1].index
     for date in high_anomaly_dates:
         ax.axvline(date, color='red', alpha=0.1)
@@ -148,7 +188,6 @@ def plot_anomalies_over_time(df: pd.DataFrame, output_dir: Path):
     ax.set_title('Autoencoder: Daily Mean Score Over Time')
     ax.legend()
     
-    # IF score over time
     ax = axes[1]
     ax.plot(daily.index, daily['if_score'], color='forestgreen', alpha=0.7, linewidth=0.5)
     ax.axhline(0, color='red', linestyle='--', label='Threshold')
@@ -156,7 +195,6 @@ def plot_anomalies_over_time(df: pd.DataFrame, output_dir: Path):
     ax.set_title('Isolation Forest: Daily Mean Score Over Time')
     ax.legend()
     
-    # Anomaly rate over time
     ax = axes[2]
     ax.bar(daily.index, daily['ae_anomaly_rate'] * 100, alpha=0.5, color='steelblue', label='AE')
     ax.bar(daily.index, daily['if_anomaly_rate'] * 100, alpha=0.5, color='forestgreen', label='IF')
@@ -165,7 +203,6 @@ def plot_anomalies_over_time(df: pd.DataFrame, output_dir: Path):
     ax.set_title('Daily Anomaly Rate by Model')
     ax.legend()
     
-    # Format x-axis
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
     plt.xticks(rotation=45)
@@ -176,9 +213,8 @@ def plot_anomalies_over_time(df: pd.DataFrame, output_dir: Path):
     print(f"Saved: {output_dir / 'anomalies_over_time.png'}")
 
 
-def plot_feature_comparison(df: pd.DataFrame, feature_cols: list, output_dir: Path):
+def plot_feature_comparison(df: pd.DataFrame, feature_cols: list, output_dir: Path) -> None:
     """Plot 3: Feature distributions for anomalies vs normal."""
-    # Select key features
     key_features = [
         'returns_1d', 'returns_5d', 'returns_20d',
         'volatility_20d', 'rsi_14', 'bb_position',
@@ -195,8 +231,7 @@ def plot_feature_comparison(df: pd.DataFrame, feature_cols: list, output_dir: Pa
     for i, feat in enumerate(key_features):
         ax = axes[i]
         
-        # Plot distributions
-        ax.hist(normal[feat], bins=50, alpha=0.5, color='steelblue', 
+        ax.hist(normal[feat], bins=50, alpha=0.5, color='steelblue',
                 label=f'Normal (n={len(normal)})', density=True)
         ax.hist(anomaly[feat], bins=50, alpha=0.5, color='red', 
                 label=f'Anomaly (n={len(anomaly)})', density=True)
@@ -206,7 +241,6 @@ def plot_feature_comparison(df: pd.DataFrame, feature_cols: list, output_dir: Pa
         ax.legend(fontsize=8)
         ax.set_title(f'{feat}')
     
-    # Hide unused subplots
     for i in range(len(key_features), len(axes)):
         axes[i].set_visible(False)
     
@@ -217,14 +251,13 @@ def plot_feature_comparison(df: pd.DataFrame, feature_cols: list, output_dir: Pa
     print(f"Saved: {output_dir / 'feature_comparison.png'}")
 
 
-def plot_top_anomalies(df: pd.DataFrame, feature_cols: list, output_dir: Path):
+def plot_top_anomalies(df: pd.DataFrame, feature_cols: list, output_dir: Path) -> None:
     """Plot 4: Examine the top anomalies in detail."""
     # Get top 20 anomalies by AE score
     top_anomalies = df.nlargest(20, 'ae_score')[['date', 'symbol', 'ae_score', 'if_score', 'ae_anomaly', 'if_anomaly'] + feature_cols[:10]]
     
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    # Top anomalies table-like plot
     ax = axes[0, 0]
     ax.axis('off')
     table_data = top_anomalies[['date', 'symbol', 'ae_score', 'if_score']].head(10)
@@ -243,7 +276,6 @@ def plot_top_anomalies(df: pd.DataFrame, feature_cols: list, output_dir: Path):
     table.scale(1.2, 1.5)
     ax.set_title('Top 10 Anomalies by AE Score', fontsize=12, fontweight='bold')
     
-    # Score comparison for top anomalies
     ax = axes[0, 1]
     top_20 = df.nlargest(50, 'ae_score')
     ax.scatter(top_20['ae_score'], top_20['if_score'], c='red', alpha=0.6, s=50)
@@ -251,14 +283,12 @@ def plot_top_anomalies(df: pd.DataFrame, feature_cols: list, output_dir: Path):
     ax.set_ylabel('IF Score')
     ax.set_title('Top 50 AE Anomalies: Score Comparison')
     
-    # Anomalies by symbol
     ax = axes[1, 0]
     symbol_counts = df[df['ae_anomaly']].groupby('symbol').size().sort_values(ascending=True).tail(15)
     symbol_counts.plot(kind='barh', ax=ax, color='steelblue')
     ax.set_xlabel('Number of Anomalies')
     ax.set_title('Anomalies by Symbol (Top 15)')
     
-    # Anomalies by month
     ax = axes[1, 1]
     df['month'] = df['date'].dt.to_period('M')
     monthly = df.groupby('month').agg({
@@ -278,17 +308,15 @@ def plot_top_anomalies(df: pd.DataFrame, feature_cols: list, output_dir: Path):
     print(f"Saved: {output_dir / 'top_anomalies.png'}")
 
 
-def plot_model_agreement(df: pd.DataFrame, output_dir: Path):
+def plot_model_agreement(df: pd.DataFrame, output_dir: Path) -> None:
     """Plot 5: Where do models agree/disagree?"""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    # Categorize samples
     both_normal = (~df['ae_anomaly']) & (~df['if_anomaly'])
     ae_only = df['ae_anomaly'] & (~df['if_anomaly'])
     if_only = (~df['ae_anomaly']) & df['if_anomaly']
     both_anomaly = df['ae_anomaly'] & df['if_anomaly']
     
-    # Agreement pie chart
     ax = axes[0, 0]
     sizes = [both_normal.sum(), ae_only.sum(), if_only.sum(), both_anomaly.sum()]
     labels = [
@@ -301,7 +329,6 @@ def plot_model_agreement(df: pd.DataFrame, output_dir: Path):
     ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
     ax.set_title('Model Agreement Breakdown')
     
-    # Score distributions by category
     ax = axes[0, 1]
     categories = {
         'Both Normal': df[both_normal]['ae_score'],
@@ -314,11 +341,9 @@ def plot_model_agreement(df: pd.DataFrame, output_dir: Path):
     ax.set_ylabel('AE Score')
     ax.set_title('AE Score by Agreement Category')
     
-    # Disagreement analysis - AE only cases
     ax = axes[1, 0]
     if ae_only.sum() > 0:
         ae_only_df = df[ae_only]
-        # What makes AE flag but not IF?
         feature_diffs = []
         for col in ['volatility_20d', 'returns_20d', 'rsi_14', 'bb_position']:
             if col in df.columns:
@@ -337,7 +362,6 @@ def plot_model_agreement(df: pd.DataFrame, output_dir: Path):
         ax.text(0.5, 0.5, 'No AE-only anomalies', ha='center', va='center')
         ax.set_title('AE-Only Anomalies: Feature Differences')
     
-    # Timeline of disagreements
     ax = axes[1, 1]
     df['agreement'] = 'Both Normal'
     df.loc[ae_only, 'agreement'] = 'AE Only'
@@ -361,23 +385,24 @@ def plot_model_agreement(df: pd.DataFrame, output_dir: Path):
     print(f"Saved: {output_dir / 'model_agreement.png'}")
 
 
-def archive_existing_diagnostics(diagnostics_dir: Path, archive_base_dir: Path):
-    """Archive existing diagnostics directory if it contains files."""
+def archive_existing_diagnostics(diagnostics_dir: Path, archive_base_dir: Path) -> bool:
+    """Archive existing diagnostics directory if it contains files.
+    
+    Returns:
+        True if archiving occurred, False otherwise
+    """
     if not diagnostics_dir.exists():
         return False
     
-    # Check if directory has any files (excluding archive subdirectory)
-    existing_files = [f for f in diagnostics_dir.glob('*') 
+    existing_files = [f for f in diagnostics_dir.glob('*')
                       if f.is_file() and f.name != 'archive']
     if not existing_files:
         return False
     
-    # Create archive directory with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     archive_dir = archive_base_dir / f"diagnostics_{timestamp}"
     archive_dir.mkdir(parents=True, exist_ok=True)
     
-    # Move all files to archive
     for file_path in existing_files:
         shutil.move(str(file_path), str(archive_dir / file_path.name))
     
@@ -385,7 +410,7 @@ def archive_existing_diagnostics(diagnostics_dir: Path, archive_base_dir: Path):
     return True
 
 
-def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
+def generate_summary_stats(df: pd.DataFrame, output_dir: Path) -> None:
     """Generate text summary of findings."""
     summary = []
     summary.append("=" * 80)
@@ -394,7 +419,6 @@ def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
     summary.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     summary.append("")
     
-    # Data overview
     summary.append("DATA OVERVIEW")
     summary.append("-" * 40)
     summary.append(f"Total samples: {len(df):,}")
@@ -402,7 +426,6 @@ def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
     summary.append(f"Symbols: {df['symbol'].nunique()}")
     summary.append("")
     
-    # AE stats
     summary.append("AUTOENCODER")
     summary.append("-" * 40)
     ae_anomalies = df['ae_anomaly'].sum()
@@ -413,7 +436,6 @@ def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
     summary.append(f"Score median: {df['ae_score'].median():.6f}")
     summary.append("")
     
-    # IF stats
     summary.append("ISOLATION FOREST")
     summary.append("-" * 40)
     if_anomalies = df['if_anomaly'].sum()
@@ -422,7 +444,6 @@ def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
     summary.append(f"Score mean: {df['if_score'].mean():.6f}")
     summary.append("")
     
-    # Agreement
     summary.append("MODEL AGREEMENT")
     summary.append("-" * 40)
     both_flag = (df['ae_anomaly'] & df['if_anomaly']).sum()
@@ -433,7 +454,6 @@ def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
     summary.append(f"Agreement rate: {agree/len(df)*100:.2f}%")
     summary.append("")
     
-    # Top anomaly periods
     summary.append("HIGH ANOMALY PERIODS")
     summary.append("-" * 40)
     df['month'] = df['date'].dt.to_period('M')
@@ -447,7 +467,6 @@ def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
         summary.append(f"  {month}: AE={row['ae_rate']*100:.1f}%, IF={row['if_rate']*100:.1f}%")
     summary.append("")
     
-    # Top anomaly symbols
     summary.append("SYMBOLS WITH MOST ANOMALIES")
     summary.append("-" * 40)
     symbol_anomalies = df[df['ae_anomaly']].groupby('symbol').size().sort_values(ascending=False).head(10)
@@ -461,7 +480,6 @@ def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
     
     summary_text = "\n".join(summary)
     
-    # Save and print
     with open(output_dir / 'diagnostic_summary.txt', 'w') as f:
         f.write(summary_text)
     
@@ -469,16 +487,39 @@ def generate_summary_stats(df: pd.DataFrame, output_dir: Path):
     print(f"\nSaved: {output_dir / 'diagnostic_summary.txt'}")
 
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Generate visual diagnostics for anomaly detection models',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Use default model type (individual)
+    python scripts/visualize_model.py
+    
+    # Specify model type
+    python scripts/visualize_model.py --model-type individual
+    python scripts/visualize_model.py --model-type cross_sectional
+        """
+    )
+    parser.add_argument(
+        '--model-type', '-m',
+        type=str,
+        default='individual',
+        choices=['individual', 'cross_sectional'],
+        help='Model type to visualize (default: individual)'
+    )
+    
+    args = parser.parse_args()
+    
     print("=" * 80)
     print("MODEL BEHAVIOR VISUAL DIAGNOSTIC")
     print("=" * 80)
+    print(f"Model type: {args.model_type}")
     
     project_root = Path(__file__).parent.parent
-    output_dir = project_root / 'results' / 'diagnostics'
-    archive_base_dir = project_root / 'results' / 'diagnostics' / 'archive'
+    output_dir = project_root / 'results' / 'diagnostics' / args.model_type
+    archive_base_dir = project_root / 'results' / 'diagnostics' / args.model_type / 'archive'
     
-    # Archive existing diagnostics if they exist
     archive_existing_diagnostics(output_dir, archive_base_dir)
     
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -486,7 +527,7 @@ def main():
     print(f"\nOutput directory: {output_dir}")
     print("\nLoading data and scoring...")
     
-    df, feature_cols, ae_model, if_model = load_data_and_score(project_root)
+    df, feature_cols, ae_model, if_model = load_data_and_score(project_root, args.model_type)
     
     print(f"Loaded {len(df):,} samples")
     print(f"AE anomalies: {df['ae_anomaly'].sum():,}")

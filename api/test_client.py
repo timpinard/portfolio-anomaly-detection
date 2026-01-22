@@ -80,7 +80,7 @@ def test_concentrated_portfolio():
     
     response = requests.post(f"{API_URL}/portfolio/analyze", json=portfolio)
     result = response.json()
-    
+
     print(f"Risk Level: {result['risk_level']}")
     print(f"Concentration Risk: {result['concentration_risk']}")
     print(f"\nPortfolio Metrics:")

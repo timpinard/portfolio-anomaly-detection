@@ -59,6 +59,7 @@ class AutoencoderAnomalyDetector(BaseAnomalyModel):
         self.encoding_dim = encoding_dim
         self.hidden_dims = hidden_dims
         self.threshold = None
+        self.history = {'loss': [], 'val_loss': []}  # Track training history
         
         # Only initialize model if input_dim is provided (for training)
         if input_dim is not None:
@@ -66,8 +67,18 @@ class AutoencoderAnomalyDetector(BaseAnomalyModel):
         else:
             self.model = None
         
-    def fit(self, X, epochs=100, batch_size=32, learning_rate=0.001):
-        """Train autoencoder."""
+    def fit(self, X, epochs=100, batch_size=32, learning_rate=0.001, threshold_percentile=99):
+        """Train autoencoder.
+
+        Args:
+            X: Training data
+            epochs: Number of training epochs
+            batch_size: Batch size for training
+            learning_rate: Learning rate for optimizer
+            threshold_percentile: Percentile of reconstruction error to use as threshold (1-99).
+                                  Higher = fewer false positives, lower recall.
+                                  Lower = more false positives, higher recall.
+        """
         from torch.utils.data import DataLoader, TensorDataset
         from sklearn.preprocessing import StandardScaler
         
@@ -79,11 +90,14 @@ class AutoencoderAnomalyDetector(BaseAnomalyModel):
         dataset = TensorDataset(
             torch.FloatTensor(X_scaled)
         )
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True,)
         
         # Training
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         criterion = nn.MSELoss()
+        
+        # Reset history
+        self.history = {'loss': [], 'val_loss': []}
         
         self.model.train()
         for epoch in range(epochs):
@@ -102,8 +116,12 @@ class AutoencoderAnomalyDetector(BaseAnomalyModel):
                 
                 epoch_loss += loss.item()
             
+            # Record average loss for this epoch
+            avg_loss = epoch_loss / len(loader)
+            self.history['loss'].append(avg_loss)
+            
             if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(loader):.4f}")
+                print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
         
         # Calculate threshold (99th percentile of reconstruction error)
         self.model.eval()
@@ -111,7 +129,8 @@ class AutoencoderAnomalyDetector(BaseAnomalyModel):
             X_tensor = torch.FloatTensor(X_scaled).to(self.device)
             reconstructed = self.model(X_tensor)
             errors = torch.mean((X_tensor - reconstructed) ** 2, dim=1)
-            self.threshold = torch.quantile(errors, 0.99).item()
+            quantile = threshold_percentile / 100.0
+            self.threshold = torch.quantile(errors, quantile).item()
     
     def predict(self, X):
         """Predict anomalies (1 = normal, -1 = anomaly)."""
@@ -119,67 +138,73 @@ class AutoencoderAnomalyDetector(BaseAnomalyModel):
         return (scores > self.threshold).astype(int) * -2 + 1  # Convert to -1/1
     
     def score(self, X):
-        """Return reconstruction error as anomaly score."""
-        X_scaled = self.scaler.transform(X)
+        """
+        Compute reconstruction error for already-scaled inputs.
+        """
         self.model.eval()
+
         with torch.no_grad():
-            X_tensor = torch.FloatTensor(X_scaled).to(self.device)
-            reconstructed = self.model(X_tensor)
-            errors = torch.mean((X_tensor - reconstructed) ** 2, dim=1)
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
+            recon = self.model(X_tensor)
+
+            # Mean squared reconstruction error per sample
+            errors = torch.mean((X_tensor - recon) ** 2, dim=1)
+
         return errors.cpu().numpy()
     
     def save(self):
-        """Save PyTorch model artifacts."""
-        # Ensure model directory exists
+        import json
+        from pathlib import Path
+
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save PyTorch model state
-        torch.save(self.model.state_dict(), self.model_dir / 'model.pth')
-        
-        # Save scaler
-        joblib.dump(self.scaler, self.model_dir / 'scaler.pkl')
-        
-        # Save metadata including architecture and threshold
+
+        # Save model weights
+        torch.save(self.model.state_dict(), self.model_dir / "model.pt")
+
+        # Save metadata
         metadata = {
-            'sector': self.sector,
-            'threshold': float(self.threshold) if self.threshold is not None else None,
-            'input_dim': self.input_dim,
-            'encoding_dim': self.encoding_dim,
-            'hidden_dims': self.hidden_dims,
-            'device': self.device
+            "sector": self.sector,
+            "input_dim": self.input_dim,
+            "encoding_dim": self.encoding_dim,
+            "hidden_dims": self.hidden_dims,
+            "device": str(self.device),
+            "threshold": self.threshold,
         }
-        with open(self.model_dir / 'metadata.json', 'w') as f:
+
+        with open(self.model_dir / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)
-        
-        print(f"Model saved to {self.model_dir}")
-    
-    def load(self):
-        """Load PyTorch model artifacts."""
-        # Load metadata first to reconstruct model architecture
-        with open(self.model_dir / 'metadata.json', 'r') as f:
+
+    @classmethod
+    def load(cls, model_dir):
+        model_dir = Path(model_dir)
+
+        # --- load metadata ---
+        metadata_path = model_dir / "metadata.json"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Missing metadata.json in {model_dir}")
+
+        with open(metadata_path, "r") as f:
             metadata = json.load(f)
-        
-        # Set attributes from metadata
-        self.input_dim = metadata['input_dim']
-        self.encoding_dim = metadata['encoding_dim']
-        self.hidden_dims = metadata['hidden_dims']
-        self.threshold = metadata.get('threshold')
-        self.device = metadata.get('device', 'cpu')
-        
-        # Reconstruct model architecture
-        self.model = Autoencoder(
-            self.input_dim, 
-            self.encoding_dim, 
-            self.hidden_dims
-        ).to(self.device)
-        
-        # Load model weights
-        self.model.load_state_dict(
-            torch.load(self.model_dir / 'model.pth', map_location=self.device)
+
+        # --- reconstruct model ---
+        model = cls(
+            sector=metadata["sector"],
+            model_dir=model_dir,
+            input_dim=metadata["input_dim"],
+            encoding_dim=metadata["encoding_dim"],
+            hidden_dims=metadata["hidden_dims"],
+            device=metadata.get("device", "cpu"),
         )
-        self.model.eval()
-        
-        # Load scaler
-        self.scaler = joblib.load(self.model_dir / 'scaler.pkl')
-        
-        print(f"Model loaded from {self.model_dir}")
+
+        # --- load weights ---
+        weights_path = model_dir / "model.pt"
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Missing model.pt in {model_dir}")
+
+        model.model.load_state_dict(
+            torch.load(weights_path, map_location=model.device)
+        )
+
+        model.threshold = metadata.get("threshold")
+
+        return model

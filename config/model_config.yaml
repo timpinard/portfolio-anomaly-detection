@@ -11,23 +11,22 @@ data:
   
   # Update frequency
   update_frequency: daily
-
-models:
-  # Autoencoder configuration
-  autoencoder:
-    encoding_dim: 15
-    hidden_dims: [128, 64, 32]
-    epochs: 100
-    batch_size: 64
-    learning_rate: 0.001
-    device: cuda  # or 'cpu'
   
-  # Isolation Forest configuration
-  isolation_forest:
-    contamination: 0.05  # 5% of market is "unusual"
-    n_estimators: 200
-    max_samples: 1024 #auto is 256
-    random_state: 42
+  # Date ranges should be specified via CLI arguments when training
+  # Use --train-start and --train-end in train_model.py
+  # Leave as null - dates are training-time decisions, not configuration
+  train_start_date: null
+  train_end_date: null
+  test_start_date: null
+  test_end_date: null
+
+training:
+  # Data cleaning with Mahalanobis distance
+  # Not in use yet, future experimentation, candidate: input features, latent space or reconstruction error
+  mahalanobis_cleaning:
+    enabled: true
+    contamination: 0.05  # Remove top 5% most extreme multivariate outliers
+    use_robust: true     # Use MinCovDet (robust to outliers) vs empirical covariance
 
 features:
   # Return calculation windows (days)
@@ -73,3 +72,109 @@ api:
 logging:
   level: INFO
   file: logs/portfolio_analysis.log
+
+# =============================================================================
+# Model Type Configurations
+# =============================================================================
+# Each model type defines a different approach to anomaly detection
+model_types:
+  # Individual Model Type: Individual stock features
+  # Detects unusual patterns in single stocks
+  individual:
+    model_type:
+      name: individual
+      description: "Individual stock features - detects unusual patterns in single stocks"
+      version: "2.0"
+    
+    features:
+      extractor: individual
+      config: {}
+    
+    data:
+      universe: sp500_sample
+      lookback_years: 10
+      # Date ranges should be specified via CLI arguments (--train-start, --train-end)
+      # Leave as null - dates are training-time decisions, not model configuration
+      train_start_date: null
+      train_end_date: null
+      train_test_split: 0.8
+    
+    models:
+      autoencoder:
+        encoding_dim: 15
+        hidden_dims: [128, 64, 32]
+        epochs: 100
+        batch_size: 64
+        learning_rate: 0.001
+        device: cuda
+        threshold_percentile: 97
+
+      isolation_forest:
+        contamination: 0.05  # 5% of market is "unusual"
+        n_estimators: 200
+        max_samples: 1024 #auto is 256
+        random_state: 42
+
+    # What this model type detects:
+    # - Unusual individual stock behavior (extreme returns, volatility spikes)
+    # - Technical breakdowns (oversold/overbought, MACD divergence)
+    # - Volume anomalies
+    #
+    # Limitations:
+    # - Does NOT detect stocks diverging from the market
+    # - A stock down 5% when market is up 5% looks the same as down 5% when market is down 5%
+
+  # Cross-Sectional Model Type: Cross-sectional features
+  # Detects stocks diverging from the market
+  cross_sectional:
+    model_type:
+      name: cross_sectional
+      description: "Cross-sectional features - detects stocks moving differently from the universe"
+      version: "2.0"
+    
+    features:
+      extractor: cross_sectional
+      config:
+        market_proxy: SPY
+        correlation_windows: [20, 60]
+        beta_window: 60
+        rank_window: 20
+    
+    data:
+      universe: sp500_sample
+      lookback_years: 10
+      # Date ranges should be specified via CLI arguments (--train-start, --train-end)
+      # Leave as null - dates are training-time decisions, not model configuration
+      train_start_date: null
+      train_end_date: null
+    
+    models:
+      autoencoder:
+        # Larger architecture for better reconstruction (matching individual)
+        encoding_dim: 15
+        hidden_dims: [128, 64, 32]
+        epochs: 100
+        batch_size: 64
+        learning_rate: 0.001
+        device: cuda
+        # Higher threshold = fewer alerts, more selective
+        # 99 = conservative (top 1% flagged)
+        # 97 = balanced (top 3% flagged)
+        # 95 = liberal (top 5% flagged)
+        # For ranking/screening, threshold matters less - use raw scores
+        threshold_percentile: 97
+    
+    # What this model type detects:
+    # - Stocks moving opposite to market (negative relative returns)
+    # - Correlation breakdown (sudden decorrelation from SPY)
+    # - Beta shifts (becoming defensive or negative beta)
+    # - Relative underperformance/outperformance vs peers
+    #
+    # Key features:
+    # - relative_return_1d/5d/20d: Stock return minus market return
+    # - correlation_20d/60d: Rolling correlation with SPY
+    # - correlation_change: Shift in correlation
+    # - beta_60d: Rolling market sensitivity
+    # - direction_agreement_20d: % of days moving same direction as market
+    # - zscore_vs_universe: How different from average stock today
+    # - return_rank_daily: Percentile rank vs all stocks

@@ -11,8 +11,9 @@ import pandas as pd
 import sqlite3
 import json
 import yfinance as yf
+import joblib
+from sklearn.preprocessing import StandardScaler
 
-# Add paths
 api_dir = Path(__file__).parent
 project_root = api_dir.parent
 sys.path.insert(0, str(project_root / 'src'))
@@ -22,8 +23,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from schemas import (
-    Portfolio, 
-    PortfolioAnalysisResponse, 
+    Portfolio,
+    PortfolioAnalysisResponse,
     HealthResponse,
     LLMExplanationRequest,
     LLMExplanationResponse,
@@ -31,7 +32,10 @@ from schemas import (
     OrchestratedAnalysisResponse,
     SecurityScore,
     BasketStatistics,
-    ExtendedPortfolioMetrics
+    ExtendedPortfolioMetrics,
+    PortfolioHealthRequest,
+    PortfolioHealthResponse,
+    Contributor
 )
 from business_logic import (
     calculate_portfolio_weights,
@@ -45,12 +49,11 @@ from business_logic import (
 from experimental.llm_service import is_llm_available
 from experimental.llm_agents import AgenticFlow, RecommendationInterpreterAgent, PortfolioContextAgent
 
-# Import models
 from models.autoencoder import AutoencoderAnomalyDetector
 from models.isolation_forest import IsolationForestAnomalyDetector
 from data.feature_extractor import MarketFeatureExtractor
+from portfolio.analyze import analyze_portfolio_health as run_portfolio_health_analysis
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -69,34 +72,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global model cache
 MODELS = {}
 BASKET_STATS = None
-MODEL_DIR = project_root / 'models' / 'market_universe'
+MODEL_DIR = project_root / 'models' / 'model_types' / 'individual'
 BASKET_STATS_FILE = MODEL_DIR / 'basket_stats.json'
 
 
 def load_models():
-    """Load trained models."""
+    """Load trained models from individual model type."""
     if 'autoencoder' not in MODELS:
         logger.info("Loading autoencoder model...")
-        ae_model = AutoencoderAnomalyDetector(
-            sector='autoencoder',
-            model_dir=MODEL_DIR
-        )
-        ae_model.load()
+        ae_model = AutoencoderAnomalyDetector.load(MODEL_DIR / 'autoencoder')
         MODELS['autoencoder'] = ae_model
     
     if 'isolation_forest' not in MODELS:
         logger.info("Loading isolation forest model...")
-        if_model = IsolationForestAnomalyDetector(
-            sector='isolation_forest',
-            model_dir=MODEL_DIR
-        )
-        if_model.load()
-        MODELS['isolation_forest'] = if_model
-    
+        if_path = MODEL_DIR / 'isolation_forest' / 'model.joblib'
+        if if_path.exists():
+            if_model = IsolationForestAnomalyDetector(
+                sector='isolation_forest',
+                model_dir=MODEL_DIR
+            )
+            if_model.load()
+            MODELS['isolation_forest'] = if_model
+        else:
+            logger.warning("Isolation forest model not found, using autoencoder only")
+            MODELS['isolation_forest'] = None
+
+    if 'scaler' not in MODELS:
+        scaler_path = MODEL_DIR / 'scaler.joblib'
+        if scaler_path.exists():
+            logger.info("Loading feature scaler...")
+            MODELS['scaler'] = joblib.load(scaler_path)
+        else:
+            logger.warning("No scaler found - features will not be standardized")
+            MODELS['scaler'] = None
+
     return MODELS['autoencoder'], MODELS['isolation_forest']
+
+
+def get_scaler() -> Optional[StandardScaler]:
+    """Get the loaded scaler, or None if not available."""
+    if 'scaler' not in MODELS:
+        load_models()
+    return MODELS.get('scaler')
 
 
 def load_basket_stats() -> Optional[BasketStatistics]:
@@ -139,16 +158,14 @@ def compute_basket_stats_on_demand(
     try:
         extractor = MarketFeatureExtractor(str(db_path))
         
-        # Get training set symbols
         conn = sqlite3.connect(db_path)
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT symbol FROM market_features ORDER BY symbol")
-            symbols = [row[0] for row in cursor.fetchall()]
-        except sqlite3.OperationalError:
-            cursor = conn.cursor()
             cursor.execute("SELECT DISTINCT symbol FROM market_prices ORDER BY symbol")
             symbols = [row[0] for row in cursor.fetchall()]
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Could not read market_prices table: {e}")
+            symbols = []
         conn.close()
         
         if len(symbols) < 5:
@@ -174,12 +191,18 @@ def compute_basket_stats_on_demand(
                 feature_cols = extractor.get_feature_columns(features)
                 X = np.array([[latest[col] for col in feature_cols]])
                 X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-                
+
+                # Apply scaler if available
+                scaler = get_scaler()
+                if scaler is not None:
+                    X = scaler.transform(X)
+
                 ae_score = float(ae_model.score(X)[0])
-                if_score = float(if_model.score(X)[0])
-                
                 ae_scores.append(ae_score)
-                if_scores.append(if_score)
+                
+                if if_model is not None:
+                    if_score = float(if_model.score(X)[0])
+                    if_scores.append(if_score)
                 
             except Exception as e:
                 logger.debug(f"Error scoring {symbol}: {e}")
@@ -189,16 +212,17 @@ def compute_basket_stats_on_demand(
             logger.warning(f"Insufficient valid scores: {len(ae_scores)}")
             return None
         
-        BASKET_STATS = BasketStatistics(
+        basket_stats = BasketStatistics(
             ae_mean=float(np.mean(ae_scores)),
             ae_std=float(np.std(ae_scores)),
-            if_mean=float(np.mean(if_scores)),
-            if_std=float(np.std(if_scores)),
+            if_mean=float(np.mean(if_scores)) if if_scores else 0.0,
+            if_std=float(np.std(if_scores)) if if_scores else 0.0,
             n_securities=len(ae_scores),
             computed_at=datetime.utcnow().isoformat()
         )
         
-        # Cache to file for future use
+        BASKET_STATS = basket_stats
+        
         try:
             BASKET_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(BASKET_STATS_FILE, 'w') as f:
@@ -228,13 +252,12 @@ def fetch_from_yahoo_and_save(symbol: str, db_path: Path) -> pd.DataFrame:
     logger.info(f"Fetching {symbol} from Yahoo Finance...")
     try:
         ticker = yf.Ticker(symbol)
-        df = ticker.history(period="3y")
+        df = ticker.history(period="10y")
         
         if df.empty:
             logger.warning(f"No data returned from Yahoo Finance for {symbol}")
             return pd.DataFrame()
         
-        # Reset index and format
         df = df.reset_index()
         df['symbol'] = symbol
         df.rename(columns={
@@ -246,13 +269,10 @@ def fetch_from_yahoo_and_save(symbol: str, db_path: Path) -> pd.DataFrame:
             'Volume': 'volume'
         }, inplace=True)
         
-        # Ensure date is string format
         df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
         
-        # Save to database
         conn = sqlite3.connect(db_path)
         
-        # Create table if not exists
         conn.execute("""
             CREATE TABLE IF NOT EXISTS market_prices (
                 date TEXT,
@@ -266,10 +286,8 @@ def fetch_from_yahoo_and_save(symbol: str, db_path: Path) -> pd.DataFrame:
             )
         """)
         
-        # Delete existing data for this symbol (replace)
         conn.execute("DELETE FROM market_prices WHERE symbol = ?", (symbol,))
         
-        # Insert new data
         df[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']].to_sql(
             'market_prices', conn, if_exists='append', index=False
         )
@@ -279,7 +297,6 @@ def fetch_from_yahoo_and_save(symbol: str, db_path: Path) -> pd.DataFrame:
         
         logger.info(f"✓ Fetched and saved {len(df)} records for {symbol}")
         
-        # Format for return (set date as index)
         df['date'] = pd.to_datetime(df['date'])
         df.set_index('date', inplace=True)
         
@@ -310,7 +327,6 @@ def ensure_symbol_data(symbol: str, db_path: Path, extractor: MarketFeatureExtra
         logger.info(f"Symbol {symbol} not found in database or insufficient data, fetching from Yahoo Finance...")
         df = fetch_from_yahoo_and_save(symbol, db_path)
         
-        # Reload from database after saving
         if not df.empty:
             df = extractor.load_price_data(symbol)
     
@@ -322,7 +338,6 @@ def get_current_prices(symbols: list) -> Dict[str, float]:
     db_path = project_root / 'data' / 'processed' / 'market_data.sqlite'
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Create database if it doesn't exist
     if not db_path.exists():
         conn = sqlite3.connect(db_path)
         conn.execute("""
@@ -424,14 +439,12 @@ def score_individual_securities(
     db_path = project_root / 'data' / 'processed' / 'market_data.sqlite'
     extractor = MarketFeatureExtractor(str(db_path))
     
-    # Materiality threshold - positions below this weight are considered immaterial
     MATERIALITY_THRESHOLD = 0.01  # 1%
     
     security_scores = []
     
     for symbol, position in portfolio.positions.items():
         try:
-            # Load and calculate features for this security
             df = ensure_symbol_data(symbol, db_path, extractor)
             if df.empty or len(df) < 60:
                 logger.warning(f"Insufficient data for {symbol}")
@@ -442,29 +455,32 @@ def score_individual_securities(
                 logger.warning(f"Could not calculate features for {symbol}")
                 continue
             
-            # Get most recent features
             latest = features.iloc[-1]
             feature_cols = extractor.get_feature_columns(features)
             X = np.array([[latest[col] for col in feature_cols]])
             X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # Score with both models
+
+            scaler = get_scaler()
+            if scaler is not None:
+                X = scaler.transform(X)
+
             ae_score = float(ae_model.score(X)[0])
             ae_prediction = int(ae_model.predict(X)[0])
             ae_is_anomaly = (ae_prediction == -1)
             
-            if_score = float(if_model.score(X)[0])
-            if_prediction = int(if_model.predict(X)[0])
-            if_is_anomaly = (if_prediction == -1)
+            if_score = None
+            if_is_anomaly = None
+            if if_model is not None:
+                if_score = float(if_model.score(X)[0])
+                if_prediction = int(if_model.predict(X)[0])
+                if_is_anomaly = (if_prediction == -1)
             
-            consensus_anomaly = ae_is_anomaly and if_is_anomaly
+            consensus_anomaly = ae_is_anomaly and (if_is_anomaly if if_is_anomaly is not None else False)
             
-            # Get price and calculate position value
             price = current_prices.get(symbol, 0.0)
             position_value = position.shares * price
             weight = weights.get(symbol, 0.0)
             
-            # Calculate cost basis and gain/loss if available
             cost_basis = position.cost_basis
             total_cost = None
             gain_loss_dollars = None
@@ -475,23 +491,19 @@ def score_individual_securities(
                 gain_loss_dollars = position_value - total_cost
                 gain_loss_percent = ((price / cost_basis) - 1) * 100
             
-            # Get sector information
             sector = get_sector_for_symbol(symbol)
             
-            # Calculate z-scores if basket stats available
             ae_z_score = None
             if_z_score = None
             if basket_stats:
                 if basket_stats.ae_std > 0:
                     ae_z_score = (ae_score - basket_stats.ae_mean) / basket_stats.ae_std
-                if basket_stats.if_std > 0:
+                if if_score is not None and basket_stats.if_std > 0:
                     if_z_score = (if_score - basket_stats.if_mean) / basket_stats.if_std
             
-            # Format z-scores for display
             ae_z_display = format_z_score_display(ae_z_score)
             if_z_display = format_z_score_display(if_z_score)
             
-            # Determine materiality
             is_material = weight >= MATERIALITY_THRESHOLD
             materiality_note = None
             if not is_material:
@@ -499,7 +511,6 @@ def score_individual_securities(
             elif weight > 0.25:
                 materiality_note = f"Large position ({weight*100:.1f}%) - significant portfolio impact"
             
-            # Determine status and reason
             if consensus_anomaly:
                 status = "anomaly"
                 if is_material:
@@ -516,7 +527,6 @@ def score_individual_securities(
                 status = "normal"
                 status_reason = None
             
-            # Add z-score context to status reason for extreme cases
             if ae_z_score is not None and abs(ae_z_score) > 3:
                 z_context = f" - EXTREME deviation ({ae_z_display})"
                 if status_reason:
@@ -530,7 +540,6 @@ def score_individual_securities(
                 if status_reason:
                     status_reason += z_context
             
-            # Add gain/loss context to status reason for big winners/losers
             if gain_loss_percent is not None:
                 if gain_loss_percent > 100:
                     if status_reason:
@@ -569,7 +578,6 @@ def score_individual_securities(
             logger.error(f"Error scoring {symbol}: {e}")
             continue
     
-    # Sort by position value (largest first)
     security_scores.sort(key=lambda x: x.position_value, reverse=True)
     
     return security_scores
@@ -599,7 +607,10 @@ def compute_extended_metrics(
     
     # Compute weighted aggregate scores
     ae_weighted_score = sum(s.ae_score * s.weight for s in security_scores)
-    if_weighted_score = sum(s.if_score * s.weight for s in security_scores)
+    if_weighted_score = None
+    if_scores_with_values = [s for s in security_scores if s.if_score is not None]
+    if if_scores_with_values:
+        if_weighted_score = sum(s.if_score * s.weight for s in if_scores_with_values)
     
     # Compute weighted z-scores if available
     ae_weighted_z = None
@@ -611,7 +622,7 @@ def compute_extended_metrics(
     
     # Count anomalies
     ae_anomaly_count = sum(1 for s in security_scores if s.ae_is_anomaly)
-    if_anomaly_count = sum(1 for s in security_scores if s.if_is_anomaly)
+    if_anomaly_count = sum(1 for s in security_scores if s.if_is_anomaly is not None and s.if_is_anomaly)
     consensus_anomaly_count = sum(1 for s in security_scores if s.consensus_anomaly)
     
     # Total value
@@ -641,10 +652,10 @@ def compute_extended_metrics(
         ae_weighted_z_score=ae_weighted_z,
         if_weighted_z_score=if_weighted_z,
         anomaly_rate_ae=ae_anomaly_count / n_securities,
-        anomaly_rate_if=if_anomaly_count / n_securities,
+        anomaly_rate_if=if_anomaly_count / n_securities if if_anomaly_count > 0 or any(s.if_is_anomaly is not None for s in security_scores) else None,
         anomaly_rate_consensus=consensus_anomaly_count / n_securities,
         anomaly_count_ae=ae_anomaly_count,
-        anomaly_count_if=if_anomaly_count,
+        anomaly_count_if=if_anomaly_count if if_anomaly_count > 0 or any(s.if_is_anomaly is not None for s in security_scores) else None,
         anomaly_count_consensus=consensus_anomaly_count,
         security_scores=security_scores,
         basket_stats=basket_stats,
@@ -656,17 +667,13 @@ def calculate_portfolio_features(portfolio: Portfolio) -> Tuple[np.ndarray, Dict
     """Calculate features for portfolio, fetching from Yahoo Finance if needed."""
     symbols = list(portfolio.positions.keys())
     
-    # Get current prices (this will also fetch missing symbols from Yahoo)
     current_prices = get_current_prices(symbols)
     
-    # Calculate weights
     weights = calculate_portfolio_weights(portfolio.positions, current_prices)
     
-    # Get feature extractor
     db_path = project_root / 'data' / 'processed' / 'market_data.sqlite'
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Create database if it doesn't exist
     if not db_path.exists():
         conn = sqlite3.connect(db_path)
         conn.execute("""
@@ -686,20 +693,16 @@ def calculate_portfolio_features(portfolio: Portfolio) -> Tuple[np.ndarray, Dict
     
     extractor = MarketFeatureExtractor(str(db_path))
     
-    # Get latest features for each position
     position_features = []
     for symbol in symbols:
         try:
-            # Ensure data exists (fetch from Yahoo if needed)
             df = ensure_symbol_data(symbol, db_path, extractor)
             if df.empty:
                 logger.warning(f"No data available for {symbol} after fetch attempt")
                 continue
             
-            # Calculate features
             features = extractor.calculate_all_features(df)
             if not features.empty:
-                # Use most recent row
                 position_features.append(features.iloc[-1])
         except Exception as e:
             logger.error(f"Error calculating features for {symbol}: {e}")
@@ -708,11 +711,9 @@ def calculate_portfolio_features(portfolio: Portfolio) -> Tuple[np.ndarray, Dict
     if not position_features:
         raise HTTPException(status_code=400, detail="Could not calculate features for portfolio")
     
-    # Combine features (weighted average based on portfolio weights)
     feature_df = pd.DataFrame(position_features)
     feature_cols = [col for col in feature_df.columns if col != 'symbol']
     
-    # Weight features by position size
     weighted_features = {}
     for col in feature_cols:
         weighted_features[col] = sum(
@@ -720,14 +721,15 @@ def calculate_portfolio_features(portfolio: Portfolio) -> Tuple[np.ndarray, Dict
             for i in range(len(feature_df))
         )
     
-    # Convert to array
     feature_values = [weighted_features[col] for col in feature_cols]
     X = np.array([feature_values])
     
-    # Replace inf and NaN
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # Return both array and dictionary for interpretation
+
+    scaler = get_scaler()
+    if scaler is not None:
+        X = scaler.transform(X)
+
     return X, weights, current_prices, weighted_features
 
 
@@ -742,6 +744,7 @@ def root():
             "analyze": "/portfolio/analyze",
             "explain": "/portfolio/explain",
             "analyze_and_explain": "/portfolio/analyze-and-explain",
+            "portfolio_health": "/portfolio/health",
             "docs": "/docs"
         }
     }
@@ -750,11 +753,9 @@ def root():
 @app.get("/health", response_model=HealthResponse)
 def health_check():
     """Health check endpoint."""
-    # Check if models exist
-    ae_path = MODEL_DIR / 'autoencoder' / 'model.pth'
+    ae_path = MODEL_DIR / 'autoencoder' / 'model.pt'
     if_path = MODEL_DIR / 'isolation_forest' / 'model.joblib'
     
-    # Check basket stats
     basket_stats = load_basket_stats()
     
     return {
@@ -781,51 +782,52 @@ def analyze_portfolio(portfolio: Portfolio):
     - Actionable recommendations
     """
     try:
-        # Load models
         ae_model, if_model = load_models()
         
-        # Calculate portfolio features
         X, weights, current_prices, weighted_features = calculate_portfolio_features(portfolio)
         
-        # Run models
         ae_score = float(ae_model.score(X)[0])
         ae_prediction = int(ae_model.predict(X)[0])
         ae_is_anomaly = (ae_prediction == -1)
         ae_threshold = float(ae_model.threshold)
         
-        if_score = float(if_model.score(X)[0])
-        if_prediction = int(if_model.predict(X)[0])
-        if_is_anomaly = (if_prediction == -1)
+        if_score = None
+        if_is_anomaly = None
+        if if_model is not None:
+            if_score = float(if_model.score(X)[0])
+            if_prediction = int(if_model.predict(X)[0])
+            if_is_anomaly = (if_prediction == -1)
         
-        # Consensus
-        consensus = {
-            "both_flagged": ae_is_anomaly and if_is_anomaly,
-            "either_flagged": ae_is_anomaly or if_is_anomaly,
-            "models_agree": ae_is_anomaly == if_is_anomaly,
-            "confidence": "high" if ae_is_anomaly == if_is_anomaly else "medium"
-        }
+        if if_model is not None:
+            consensus = {
+                "both_flagged": ae_is_anomaly and if_is_anomaly,
+                "either_flagged": ae_is_anomaly or if_is_anomaly,
+                "models_agree": ae_is_anomaly == if_is_anomaly,
+                "confidence": "high" if ae_is_anomaly == if_is_anomaly else "medium"
+            }
+        else:
+            consensus = {
+                "both_flagged": ae_is_anomaly,
+                "either_flagged": ae_is_anomaly,
+                "models_agree": True,
+                "confidence": "medium"
+            }
         
-        # Calculate concentration metrics
         concentration_metrics = calculate_concentration_metrics(weights)
         concentration_risk = assess_concentration_risk(concentration_metrics)
         
-        # Overall risk level
         risk_level = get_risk_level(ae_score, ae_threshold, concentration_risk)
         
-        # Interpret features
         feature_conclusions = interpret_portfolio_features(weighted_features, ae_score, ae_threshold)
         
-        # Generate recommendations
         recommendations = generate_recommendations(
             risk_level,
             concentration_metrics,
             ae_is_anomaly
         )
         
-        # Generate message
         message = generate_message(ae_is_anomaly, risk_level, ae_score, ae_threshold)
         
-        # Portfolio metrics
         total_value = sum(
             pos.shares * current_prices.get(symbol, 0) 
             for symbol, pos in portfolio.positions.items()
@@ -840,20 +842,24 @@ def analyze_portfolio(portfolio: Portfolio):
             "top_3_concentration": concentration_metrics['top_3_concentration']
         }
         
+        model_results = {
+            "autoencoder": {
+                "score": ae_score,
+                "threshold": ae_threshold,
+                "is_anomaly": ae_is_anomaly
+            },
+            "consensus": consensus
+        }
+        
+        if if_model is not None:
+            model_results["isolation_forest"] = {
+                "score": if_score,
+                "is_anomaly": if_is_anomaly
+            }
+        
         return PortfolioAnalysisResponse(
             timestamp=datetime.utcnow().isoformat(),
-            model_results={
-                "autoencoder": {
-                    "score": ae_score,
-                    "threshold": ae_threshold,
-                    "is_anomaly": ae_is_anomaly
-                },
-                "isolation_forest": {
-                    "score": if_score,
-                    "is_anomaly": if_is_anomaly
-                },
-                "consensus": consensus
-            },
+            model_results=model_results,
             risk_level=risk_level,
             concentration_risk=concentration_risk,
             volatility_risk="medium",  
@@ -882,7 +888,6 @@ def explain_recommendations(request: LLMExplanationRequest):
                 detail="LLM service not available. Set ANTHROPIC_API_KEY environment variable."
             )
         
-        # Build context for agents
         context = {
             "recommendations": request.recommendations,
             "risk_level": request.risk_level,
@@ -891,26 +896,20 @@ def explain_recommendations(request: LLMExplanationRequest):
             "security_scores": request.security_scores or []
         }
         
-        # Add optional context if provided
         if request.include_portfolio and request.portfolio:
             context["portfolio"] = request.portfolio
         if request.analysis:
             context["analysis"] = request.analysis
         
-        # Initialize agentic flow
-        # Use portfolio context agent if full portfolio is provided, otherwise use recommendation interpreter
         if request.include_portfolio and request.portfolio:
             flow = AgenticFlow(agents=[PortfolioContextAgent()])
         else:
             flow = AgenticFlow(agents=[RecommendationInterpreterAgent()])
         
-        # Execute flow
         results = flow.execute(context)
         
-        # Get combined explanation
         explanation = None
         if results.get("explanations"):
-            # Use the first successful explanation, or combine if multiple
             if len(results["explanations"]) == 1:
                 explanation = results["explanations"][0]["explanation"]
             else:
@@ -946,58 +945,58 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
     This is a convenience endpoint that combines analysis and explanation in one call.
     """
     try:
-        # Step 1: Load models and basket stats
         logger.info("Starting portfolio analysis...")
         ae_model, if_model = load_models()
         
-        # Load or compute basket statistics
         basket_stats = load_basket_stats()
         if basket_stats is None and request.include_security_detail:
             logger.info("Computing basket statistics on demand...")
             basket_stats = compute_basket_stats_on_demand(ae_model, if_model)
         
-        # Step 2: Calculate portfolio features (aggregate)
         X, weights, current_prices, weighted_features = calculate_portfolio_features(request.portfolio)
         
-        # Step 3: Run models on aggregate portfolio
         ae_score = float(ae_model.score(X)[0])
         ae_prediction = int(ae_model.predict(X)[0])
         ae_is_anomaly = (ae_prediction == -1)
         ae_threshold = float(ae_model.threshold)
         
-        if_score = float(if_model.score(X)[0])
-        if_prediction = int(if_model.predict(X)[0])
-        if_is_anomaly = (if_prediction == -1)
+        if_score = None
+        if_is_anomaly = None
+        if if_model is not None:
+            if_score = float(if_model.score(X)[0])
+            if_prediction = int(if_model.predict(X)[0])
+            if_is_anomaly = (if_prediction == -1)
         
-        # Consensus
-        consensus = {
-            "both_flagged": ae_is_anomaly and if_is_anomaly,
-            "either_flagged": ae_is_anomaly or if_is_anomaly,
-            "models_agree": ae_is_anomaly == if_is_anomaly,
-            "confidence": "high" if ae_is_anomaly == if_is_anomaly else "medium"
-        }
+        if if_model is not None:
+            consensus = {
+                "both_flagged": ae_is_anomaly and if_is_anomaly,
+                "either_flagged": ae_is_anomaly or if_is_anomaly,
+                "models_agree": ae_is_anomaly == if_is_anomaly,
+                "confidence": "high" if ae_is_anomaly == if_is_anomaly else "medium"
+            }
+        else:
+            consensus = {
+                "both_flagged": ae_is_anomaly,
+                "either_flagged": ae_is_anomaly,
+                "models_agree": True,
+                "confidence": "medium"
+            }
         
-        # Calculate concentration metrics
         concentration_metrics = calculate_concentration_metrics(weights)
         concentration_risk = assess_concentration_risk(concentration_metrics)
         
-        # Overall risk level
         risk_level = get_risk_level(ae_score, ae_threshold, concentration_risk)
         
-        # Interpret features
         feature_conclusions = interpret_portfolio_features(weighted_features, ae_score, ae_threshold)
         
-        # Generate recommendations
         recommendations = generate_recommendations(
             risk_level,
             concentration_metrics,
             ae_is_anomaly
         )
         
-        # Generate message
         message = generate_message(ae_is_anomaly, risk_level, ae_score, ae_threshold)
         
-        # Step 4: Score individual securities if requested
         security_scores = []
         extended_metrics = None
         
@@ -1019,11 +1018,11 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
                     concentration_metrics,
                     basket_stats
                 )
+                anomaly_rate_if_str = f"{extended_metrics.anomaly_rate_if:.1%}" if extended_metrics.anomaly_rate_if is not None else "N/A"
                 logger.info(f"Scored {len(security_scores)} securities, "
                            f"anomaly rate: {extended_metrics.anomaly_rate_ae:.1%} (AE), "
-                           f"{extended_metrics.anomaly_rate_if:.1%} (IF)")
+                           f"{anomaly_rate_if_str} (IF)")
         
-        # Build portfolio metrics (extended if available)
         if extended_metrics:
             portfolio_metrics = extended_metrics.model_dump()
         else:
@@ -1040,7 +1039,6 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
                 "top_3_concentration": concentration_metrics['top_3_concentration']
             }
         
-        # Create analysis response
         analysis_response = PortfolioAnalysisResponse(
             timestamp=datetime.utcnow().isoformat(),
             model_results={
@@ -1063,7 +1061,6 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
             message=message
         )
         
-        # Step 5: Generate LLM explanation if requested
         explanation_response = None
         explanation_available = False
         
@@ -1074,7 +1071,6 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
                 logger.warning("LLM not available, skipping explanation")
             else:
                 try:
-                    # Build context for agents with extended detail
                     context = {
                         "recommendations": recommendations,
                         "risk_level": risk_level,
@@ -1084,7 +1080,6 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
                         "basket_stats": basket_stats.model_dump() if basket_stats else None
                     }
                     
-                    # Debug: Log feature conclusions being sent to LLM
                     logger.info("Feature conclusions being sent to LLM:")
                     for i, conclusion in enumerate(feature_conclusions, 1):
                         logger.info(f"  {i}. [{conclusion.get('category', 'Unknown')}] {conclusion.get('severity', 'unknown').upper()}: {conclusion.get('finding', '')}")
@@ -1095,7 +1090,6 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
                         if anomalous:
                             logger.info(f"  Anomalous securities: {[s.symbol for s in anomalous]}")
                     
-                    # Add optional context if requested
                     if request.include_portfolio_context:
                         context["portfolio"] = request.portfolio
                         context["analysis"] = {
@@ -1107,16 +1101,13 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
                         }
                         logger.info(f"Full portfolio context included: {len(request.portfolio.positions)} positions")
                     
-                    # Initialize agentic flow
                     if request.include_portfolio_context:
                         flow = AgenticFlow(agents=[PortfolioContextAgent()])
                     else:
                         flow = AgenticFlow(agents=[RecommendationInterpreterAgent()])
                     
-                    # Execute flow
                     results = flow.execute(context)
                     
-                    # Get combined explanation
                     explanation = None
                     if results.get("explanations"):
                         if len(results["explanations"]) == 1:
@@ -1152,26 +1143,87 @@ def analyze_and_explain(request: OrchestratedAnalysisRequest):
             explanation_requested=request.include_explanation,
             explanation_available=explanation_available
         )
-        
+
     except Exception as e:
         logger.error(f"Orchestration error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/portfolio/health", response_model=PortfolioHealthResponse)
+def portfolio_health(request: PortfolioHealthRequest):
+    """
+    Analyze portfolio health using experiment-based anomaly scores.
+
+    This endpoint uses pre-computed anomaly scores from an experiment
+    (e.g., divergence detection) to assess portfolio health and attribution.
+
+    Returns:
+    - portfolio_score: Weighted aggregate anomaly score
+    - contra_return: Portfolio return vs market over specified horizon
+    - health_score: Combined structural + contrarian health metric
+    - contributors: Per-holding score breakdown
+    """
+    try:
+        db_path = project_root / 'data' / 'processed' / 'market_data.sqlite'
+
+        if not db_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail="Database not found. Run data pipeline first."
+            )
+
+        holdings = [{"symbol": h.symbol, "weight": h.weight} for h in request.holdings]
+
+        result = run_portfolio_health_analysis(
+            analysis_date=request.analysis_date,
+            holdings=holdings,
+            db_path=db_path,
+            model_type=request.model_type,
+            market_proxy=request.market_proxy,
+            contra_horizon=request.contra_horizon,
+        )
+
+        contributors = [
+            Contributor(
+                symbol=c["symbol"],
+                weight=c["weight"],
+                ae_score=c["ae_score"],
+                contribution=c["contribution"]
+            )
+            for c in result["contributors"]
+        ]
+
+        return PortfolioHealthResponse(
+            date=result["date"],
+            portfolio_score=result["portfolio_score"],
+            contra_return=result["contra_return"],
+            health_score=result["health_score"],
+            contributors=contributors
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Portfolio health error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
     import uvicorn
     
-    # Check if models exist
-    ae_path = MODEL_DIR / 'autoencoder' / 'model.pth'
+    ae_path = MODEL_DIR / 'autoencoder' / 'model.pt'
     if_path = MODEL_DIR / 'isolation_forest' / 'model.joblib'
     
-    if not ae_path.exists() or not if_path.exists():
-        logger.warning("⚠️  Models not found!")
-        logger.warning("Run 'make bootstrap' to fetch data and train models")
+    if not ae_path.exists():
+        logger.warning("⚠️  Autoencoder model not found!")
+        logger.warning("Run 'python scripts/train_model.py individual' to train models")
     else:
-        logger.info("✓ Models found")
+        logger.info("✓ Autoencoder model found")
+        if if_path.exists():
+            logger.info("✓ Isolation forest model found")
+        else:
+            logger.info("ℹ️  Isolation forest model not available (optional)")
     
-    # Load basket stats at startup
     basket_stats = load_basket_stats()
     if basket_stats:
         logger.info(f"✓ Basket statistics loaded ({basket_stats.n_securities} securities)")

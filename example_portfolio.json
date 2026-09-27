@@ -1,0 +1,31 @@
+{
+  "name": "Tech Growth Portfolio",
+  "description": "Sample portfolio for testing the analyzer",
+  "holdings": [
+    {
+      "symbol": "AAPL",
+      "weight": 0.25,
+      "notes": "Large cap tech - stable growth"
+    },
+    {
+      "symbol": "MSFT",
+      "weight": 0.25,
+      "notes": "Cloud and enterprise leader"
+    },
+    {
+      "symbol": "GOOGL",
+      "weight": 0.20,
+      "notes": "Search and advertising dominance"
+    },
+    {
+      "symbol": "NVDA",
+      "weight": 0.15,
+      "notes": "AI/GPU leader - higher volatility"
+    },
+    {
+      "symbol": "META",
+      "weight": 0.15,
+      "notes": "Social media and VR/AR"
+    }
+  ]
+}
